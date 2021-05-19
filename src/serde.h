@@ -40,6 +40,13 @@ char *encode_string(char *pos, const char *str, size_t len) {
   return pos + len;
 }
 
+char *encode_const_string(char *pos, const char *str) {
+  size_t len = strlen(str);
+  pos = encode_int16(pos, (int16_t)len);
+  memcpy(pos, str, len);
+  return pos + len;
+}
+
 char *encode_long_string(char *pos, const char *str, size_t len) {
   pos = encode_int32(pos, (int32_t)len);
   memcpy(pos, str, len);

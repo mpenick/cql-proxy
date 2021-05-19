@@ -101,8 +101,10 @@
 #define VALUE_TYPE_SIMPLE 1
 #define VALUE_TYPE_COLL 2
 
-#define SELECT_LOCAL "SELECT * FROM system.local WHERE key='local'"
-#define SELECT_PEERS "SELECT * FROM system.peers"
+// TODO: Fix queries. Use fast recursive descent parser
+#define SELECT_LOCAL "system.local"
+#define SELECT_PEERS "system.peers"
+#define SELECT_PEERS_V2 "system.peers_v2"
 
 #define MAX_CLIENTS 128
 
@@ -184,6 +186,54 @@ bytes_t varchar_value(const char *value) {
   int32_t len = (int32_t)strlen(value);
   memcpy(pos, value, (size_t)len);
   bytes.len = len;
+  return bytes;
+}
+
+bytes_t uuid_value(const char *value) {
+  size_t len = strlen(value);
+  if (value == NULL || len != 36) {
+    abort();
+  }
+
+  // clang-format off
+  static const signed char hex_to_half_byte[256] = {
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+     0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  10,  11,  12,  13,  14,  15,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  10,  11,  12,  13,  14,  15,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+    -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+  };
+  // clang-format on
+
+  bytes_t bytes;
+  const char *end = value + 36;
+  const char *pos = value;
+  for (size_t i = 0; i < 16; ++i) {
+    if (pos < end && *pos == '-')
+      pos++;
+    if (pos + 2 > end) {
+      abort();
+    }
+    uint8_t p0 = (uint8_t)pos[0];
+    uint8_t p1 = (uint8_t)(pos[1]);
+    if (hex_to_half_byte[p0] == -1 || hex_to_half_byte[p1] == -1) {
+      abort();
+    }
+    bytes.data[i] = (char)(hex_to_half_byte[p0] << 4) + hex_to_half_byte[p1];
+    pos += 2;
+  }
+  bytes.len = 16;
   return bytes;
 }
 
@@ -313,23 +363,27 @@ typedef struct {
 } primary_keys_t;
 
 static columns_t local_columns = {
-    7,
+    11,
     (column_t[]){{.name = "key", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "data_center", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rack", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "release_version", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
                  {.name = "partitioner", {.basic = CQL_TYPE_VARCHAR}},
-                 {.name = "tokens",
-                  {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}}}};
+                 {.name = "cluster_name", {.basic = CQL_TYPE_VARCHAR}},
+                 {.name = "cql_version", {.basic = CQL_TYPE_VARCHAR}},
+                 {.name = "schema_version", {.basic = CQL_TYPE_UUID}},
+                 {.name = "native_protocol_version", {.basic = CQL_TYPE_VARCHAR}},
+                 {.name = "tokens", {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}}}};
 
 static columns_t peers_columns = {
-    6,
+    7,
     (column_t[]){{.name = "peer", {.basic = CQL_TYPE_INET}},
                  {.name = "data_center", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rack", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "release_version", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
+                 {.name = "schema_version", {.basic = CQL_TYPE_UUID}},
                  {.name = "tokens",
                   {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}}}};
 
@@ -389,6 +443,16 @@ batch_t *alloc_batch(client_t *client) {
 void write_response_body(client_t *client, int8_t opcode, int16_t stream, const char *body, size_t body_size);
 void write_response_result(client_t *client, int16_t stream, const CassRawResult *result);
 
+void write_error(client_t *client, int16_t stream, int32_t code, const char *message, size_t len) {
+  char body[128];
+  if (len > sizeof(body) - 4 - 2) {
+    len = sizeof(body) - 4 - 2;
+  }
+  char *pos = encode_int32(body, code);
+  encode_string(pos, message, len);
+  write_response_body(client, CQL_OPCODE_ERROR, stream, body, 4 + 2 + len);
+}
+
 void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
   client_t *client = (client_t *)handle->data;
   buf->base = client->data;
@@ -396,34 +460,35 @@ void on_alloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
 }
 
 void do_error(client_t *client, int32_t code, const char *message) {
-  char body[128];
-  size_t len = strlen(message);
-  if (len > sizeof(body) - 4 - 2) {
-    len = sizeof(body) - 4 - 2;
-  }
-  char *pos = encode_int32(pos, code);
-  encode_string(pos, message, len);
-  write_response_body(client, CQL_OPCODE_ERROR, client->frame.stream, body, 4 + 2 + len);
+  write_error(client, client->frame.stream, code, message, strlen(message));
 }
 
 void do_options(client_t *client) {
-  char body[2];
+  char body[128];
   char *pos = body;
+  pos = encode_uint16(pos, 2);
+  pos = encode_const_string(pos, "CQL_VERSION");
+  pos = encode_uint16(pos, 1);
+  pos = encode_const_string(pos, "3.0.0");
+  pos = encode_const_string(pos, "COMPRESSION");
   pos = encode_uint16(pos, 0);
-  write_response_body(client, CQL_OPCODE_SUPPORTED, client->frame.stream, body, 2);
+  write_response_body(client, CQL_OPCODE_SUPPORTED, client->frame.stream, body, (size_t)(pos - body));
 }
 
 void do_startup_or_register(client_t *client) {
   char body[1];
-  write_response_body(client, CQL_OPCODE_SUPPORTED, client->frame.stream, body, 0);
+  write_response_body(client, CQL_OPCODE_READY, client->frame.stream, body, 0);
 }
 
 void on_result(CassFuture *future, void *data) {
+  request_t *request = (request_t*)data;
   const CassRawResult *result = cass_future_get_raw_result(future);
   if (result == NULL) {
-    abort(); // TODO
+    const char *message;
+    size_t message_length;
+    cass_future_error_message(future, &message, &message_length);
+    write_error(request->client, request->stream, CQL_ERROR_SERVER_ERROR, message, message_length);
   } else {
-    request_t *request = (request_t*)data;
     write_response_result(request->client, request->stream, result);
     free(request);
   }
@@ -446,7 +511,9 @@ void do_query(client_t *client) {
   int32_t len = sizeof(query);
 
   decode_long_string(client->body, query, &len);
+  query[len] = '\0';
 
+  printf("%s\n", query);
   if (strstr(query, SELECT_LOCAL) != NULL) {
     rows_t local_rows = (rows_t){
         1,
@@ -455,21 +522,24 @@ void do_query(client_t *client) {
                 {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
                 {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
                 {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
-                {.type = VALUE_TYPE_SIMPLE,
-                 .value = varchar_value(cassandra_version)},
+                {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
                 {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
-                {.type = VALUE_TYPE_SIMPLE,
-                 .value = varchar_value(cassandra_parititioner)},
-                {.type = VALUE_TYPE_COLL,
-                 .coll = {1, (bytes_t[]){varchar_value("0")}}}},
+                {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
+                {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
+                {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
+                {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
+                {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
+                {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}}},
 
         }}};
     char body[512];
     char *pos = encode_rows(body, false, "system", "local", &local_columns, &local_rows);
     write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
+    do_error(client, CQL_ERROR_SYNTAX_ERROR, "Doesn't exist");
   } else if (strstr(query, SELECT_PEERS) != NULL) {
     char body[512];
-    char *pos = encode_rows(pos, false, "system", "peers", &peers_columns, &empty_rows);
+    char *pos = encode_rows(body, false, "system", "peers", &peers_columns, &empty_rows);
     write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
   } else {
     do_request(client);
@@ -499,10 +569,6 @@ void on_frame_body(frame_t *frame, const char *data, size_t len) {
 
 void on_frame_done(frame_t *frame) {
   client_t *client = (client_t *)frame->user_data;
-
-  if (!client->batch) {
-    client->batch = alloc_batch(client);
-  }
 
   switch (frame->opcode) {
   case CQL_OPCODE_OPTIONS:
@@ -539,7 +605,7 @@ void add_to_flush(client_t *client) {
       return;
     }
   }
-  to_flush[to_flush_count] = client;
+  to_flush[to_flush_count++] = client;
   uv_mutex_unlock(&to_flush_mutex);
   uv_async_send(&async);
 }
@@ -547,7 +613,6 @@ void add_to_flush(client_t *client) {
 // Thread-safe
 void flush_client(client_t *client) {
   uv_mutex_lock(&client->mutex);
-  client->batches[client->batch_count++] = client->batch;
   for (size_t i = 0; i < client->batch_count; ++i) {
     batch_t *batch = client->batches[i];
     uv_write(&batch->req, (uv_stream_t *)&client->tcp,
@@ -573,20 +638,18 @@ response_t *get_batch_reponse(client_t *client) {
     if (client->batch_count == MAX_BATCH - 2) {
       abort(); // TODO
     }
-    client->batches[client->batch_count++] = client->batch;
     client->batch = alloc_batch(client);
+    client->batches[client->batch_count++] = client->batch;
   }
   return &client->batch->reqs[client->batch->count];
 }
 
 
 void add_response_to_batch(client_t *client, response_t *response) {
-  client->batch->bufs[client->batch->count] =
+  client->batch->bufs[client->batch->count++] =
       uv_buf_init(response->header, sizeof(response->header));
-  client->batch->count++;
-  client->batch->bufs[client->batch->count] =
+  client->batch->bufs[client->batch->count++] =
       uv_buf_init(response->body, (unsigned int)response->len);
-  client->batch->count++;
 
 }
 
@@ -597,6 +660,7 @@ void write_response_body(client_t *client, int8_t opcode, int16_t stream, const 
   char *pos = encode_header(response->header, stream, opcode);
   encode_int32(pos, (int32_t)body_size); // Length
   response->body = malloc(body_size);
+  response->len = body_size;
   memcpy(response->body, body, body_size);
   response->free_cb = on_response_body_free;
   add_response_to_batch(client, response);
@@ -615,8 +679,10 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
   response_t *response = get_batch_reponse(client);
   char *pos = encode_header(response->header, stream, (int8_t)cass_raw_result_opcode(result));
   // TODO: Handle custom payloads, warnings, tracing
-  encode_int32(pos, (int32_t)cass_raw_result_frame_length(result)); // Length
+  size_t length = cass_raw_result_frame_length(result);
+  encode_int32(pos, (int32_t)length); // Length
   response->body = (char*)cass_raw_result_frame(result);
+  response->len = length;
   response->data = result;
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
@@ -627,6 +693,7 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
 void on_close(uv_handle_t *handle) {
   printf("Client closed\n");
   client_t *client = (client_t *)handle->data;
+  // TODO: Clean up in-flight?
   batch_t *batch = client->free_batch;
   while (batch) {
     batch_t *next = batch->next;
@@ -640,15 +707,7 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_t *client = (client_t *)stream->data;
 
   if (nread > 0) {
-    client->batch = NULL;
-
     decode_frames(&client->frame, buf->base, (size_t)nread);
-
-    if (client->batch) {
-      uv_write(&client->batch->req, stream, client->batch->bufs,
-               (unsigned int)client->batch->count, on_write);
-      client->batch = NULL;
-    }
   } else {
     uv_close((uv_handle_t *)&client->tcp, on_close);
   }
@@ -709,6 +768,9 @@ bool connect_session(const char *bundle, const char *username, const char *passw
 
   cluster = cass_cluster_new();
   session = cass_session_new();
+
+  cass_cluster_set_load_balance_round_robin(cluster);
+  cass_cluster_set_token_aware_routing(cluster, cass_false);
 
   /* Setup driver to connect to the cloud using the secure connection bundle */
   if (cass_cluster_set_cloud_secure_connection_bundle(cluster, bundle) != CASS_OK) {
@@ -786,6 +848,8 @@ int main(int argc, char **argv) {
   const char *bundle = NULL;
   const char *username = NULL;
   const char *password = NULL;
+
+  cass_log_set_level(CASS_LOG_ERROR);
 
   for (int i = 0; i < argc; ++i) {
     char *arg = argv[i];

@@ -1,6 +1,22 @@
+/*
+  Copyright (c) Michael Penick
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+*/
 #include <uv.h>
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -405,27 +421,30 @@ char *encode_prepared(char *pos, const char *id, const char *keyspace,
 }
 
 static columns_t local_columns = {
-    11,
-    (column_t[]){{.name = "key", {.basic = CQL_TYPE_VARCHAR}},
+    12,
+    (column_t[]){
+                 {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
                  {.name = "data_center", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rack", {.basic = CQL_TYPE_VARCHAR}},
+                 {.name = "tokens", {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}},
+                 {.name = "key", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "release_version", {.basic = CQL_TYPE_VARCHAR}},
-                 {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
                  {.name = "partitioner", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "cluster_name", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "cql_version", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "schema_version", {.basic = CQL_TYPE_UUID}},
                  {.name = "native_protocol_version", {.basic = CQL_TYPE_VARCHAR}},
-                 {.name = "tokens", {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}}}};
+                 {.name = "host_id", {.basic = CQL_TYPE_UUID}}}};
 
 static columns_t peers_columns = {
-    7,
+    8,
     (column_t[]){{.name = "peer", {.basic = CQL_TYPE_INET}},
                  {.name = "data_center", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rack", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "release_version", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
                  {.name = "schema_version", {.basic = CQL_TYPE_UUID}},
+                 {.name = "host_id", {.basic = CQL_TYPE_UUID}},
                  {.name = "tokens",
                   {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}}}};
 
@@ -440,8 +459,8 @@ struct client_s {
   batch_t *batch;
   batch_t *batches[MAX_BATCH];
   size_t batch_count;
-  batch_t *free_batch;
   uv_mutex_t mutex;
+  bool is_closing;
 };
 
 struct request_s {
@@ -468,20 +487,30 @@ struct batch_s {
   batch_t *next;
 };
 
+#if defined(__GNUC__) || defined(__clang__)
+#define ATTRIBUTE_FORMAT(string, first) __attribute__((__format__(__printf__, string, first)))
+#else
+#define ATTRIBUTE_FORMAT(string, first)
+#endif
+
+ATTRIBUTE_FORMAT(1, 2)
+static void print(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  vfprintf(stdout, format, args); fflush(stdout);
+  va_end(args);
+}
+
 batch_t *alloc_batch(client_t *client) {
   batch_t *batch;
-  if (client->free_batch) {
-    batch = client->free_batch;
-    client->free_batch = client->free_batch->next;
-  } else {
-    batch = (batch_t *)malloc(sizeof(batch_t));
-    batch->req.data = batch;
-    batch->client = client;
-  }
+  batch = (batch_t *)malloc(sizeof(batch_t));
+  batch->req.data = batch;
+  batch->client = client;
   batch->count = 0;
   return batch;
 }
 
+void close_client(client_t *client);
 void write_response_body(client_t *client, int8_t opcode, int16_t stream, const char *body, size_t body_size);
 void write_response_result(client_t *client, int16_t stream, const CassRawResult *result);
 
@@ -559,14 +588,14 @@ void do_prepare(client_t *client) {
   columns_t bind_markers = {0};
   primary_keys_t pks = {0};
 
-  printf("prepare: %s\n", query);
+  print("prepare: %s\n", query);
   if (strstr(query, SELECT_LOCAL) != NULL) {
     char body[512];
     char *pos = encode_prepared(body, SELECT_LOCAL, "system", "local",
                                 &bind_markers, &pks, &local_columns);
     write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
   } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_SYNTAX_ERROR, "Doesn't exist");
+    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
   } else if (strstr(query, SELECT_PEERS) != NULL) {
     char body[512];
     char *pos = encode_prepared(body, SELECT_PEERS, "system", "peers",
@@ -582,17 +611,18 @@ void write_system_local(client_t *client) {
                       1,
                       (row_t[]){{
                       (value_t[]){
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
+  {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
+  {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}},
+  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
-  {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
   {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
   {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
-  {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}}},
+  {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("19e26944-ffb1-40a9-a184-a9b065e5e06b")}},
 
 }}};
   char body[512];
@@ -633,12 +663,12 @@ void do_query(client_t *client) {
     query[len] = '\0';
   }
 
-  printf("query: %s\n", query);
+  print("query: %s\n", query);
 
   if (strstr(query, SELECT_LOCAL) != NULL) {
     write_system_local(client);
   } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_SYNTAX_ERROR, "Doesn't exist");
+    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
   } else if (strstr(query, SELECT_PEERS) != NULL) {
     write_system_peers(client);
   } else {
@@ -648,15 +678,21 @@ void do_query(client_t *client) {
 
 void on_write(uv_write_t *req, int status) {
   batch_t *batch = (batch_t *)req->data;
-  batch_t *prev = batch->client->free_batch;
-  batch->client->free_batch = batch;
-  batch->next = prev;
+  if (batch->client->is_closing &&
+      uv_stream_get_write_queue_size((uv_stream_t *)&batch->client->tcp) == 0) {
+    close_client(batch->client);
+  }
+  free(batch);
 }
 
 void on_frame_header_done(frame_t *frame) {
   client_t *client = (client_t *)frame->user_data;
-  if (frame->length > (int32_t)sizeof(client->body)) {
-    abort();
+  if (frame->version < 3 || frame->version > 4) {
+    print("protocol: %d\n", frame->version);
+    do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Invalid or unsupported protocol version");
+  } else if (frame->length > (int32_t)sizeof(client->body)) {
+    do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Frame body is too big");
+    close_client(client);
   }
   client->body_pos = client->body;
 }
@@ -758,6 +794,8 @@ void add_response_to_batch(client_t *client, response_t *response) {
 // Thread-safe
 void write_response_body(client_t *client, int8_t opcode, int16_t stream, const char *body, size_t body_size) {
   uv_mutex_lock(&client->mutex);
+  if (client->is_closing) return;
+
   response_t *response = get_batch_reponse(client);
   char *pos = encode_header(response->header, stream, opcode);
   encode_int32(pos, (int32_t)body_size); // Length
@@ -778,6 +816,8 @@ void on_response_result_free(response_t *response) {
 // Thread-safe
 void write_response_result(client_t *client, int16_t stream, const CassRawResult *result) {
   uv_mutex_lock(&client->mutex);
+  if (client->is_closing) return;
+
   response_t *response = get_batch_reponse(client);
   char *pos = encode_header(response->header, stream, (int8_t)cass_raw_result_opcode(result));
   // TODO: Handle custom payloads, warnings, tracing
@@ -785,7 +825,7 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
   encode_int32(pos, (int32_t)length); // Length
   response->body = (char*)cass_raw_result_frame(result);
   response->len = length;
-  response->data = result;
+  response->data = (char *)result;
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
 
@@ -793,16 +833,18 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
 }
 
 void on_close(uv_handle_t *handle) {
-  //printf("Client closed\n");
+  //print("Client closed\n");
   client_t *client = (client_t *)handle->data;
   // TODO: Clean up in-flight?
-  batch_t *batch = client->free_batch;
-  while (batch) {
-    batch_t *next = batch->next;
-    free(batch);
-    batch = next;
-  }
   free(client);
+}
+
+void close_client(client_t *client) {
+  if (client->batch_count > 0) {
+    client->is_closing = true;
+  } else {
+    uv_close((uv_handle_t *)&client->tcp, on_close);
+  }
 }
 
 void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
@@ -811,7 +853,7 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   if (nread > 0) {
     decode_frames(&client->frame, buf->base, (size_t)nread);
   } else {
-    uv_close((uv_handle_t *)&client->tcp, on_close);
+    close_client(client);
   }
 }
 
@@ -827,14 +869,13 @@ void on_connection(uv_stream_t *server, int status) {
   rc = uv_accept(server, (uv_stream_t *)&client->tcp);
   assert(rc == 0 && "Unable to accept client connection");
 
-  //printf("Client connection\n");
+  //print("Client connection\n");
 
   client->batch = NULL;
   client->batch_count = 0;
-
-  client->free_batch = NULL;
   client->tcp.data = client;
   client->frame.user_data = client;
+  client->is_closing = false;
   uv_mutex_init(&client->mutex);
   frame_init_ex(&client->frame, on_frame_header_done, on_frame_body,
                 on_frame_done);
@@ -853,7 +894,8 @@ const char *copy_str_value(const CassValue *value) {
   }
 
   char *copy = malloc(str_length + 1);
-  strncpy(copy, str, str_length);
+  memcpy(copy, str, str_length);
+  copy[str_length] = '\0';
   return copy;
 }
 
@@ -935,7 +977,7 @@ void on_prepare(uv_prepare_t *handle) {
 }
 
 void help(const char *prog) {
-  fprintf(stderr, "%s --bundle|-b --username|-u --password|-p [--bind|-b <ip>] [--port|-p <port>]\n", prog);
+  fprintf(stderr, "%s --bundle|-b --username|-u --password|-p [--bind|-n <ip>] [--port|-t <port>]\n", prog);
   exit(1);
 }
 
@@ -955,12 +997,12 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < argc; ++i) {
     char *arg = argv[i];
-    if (strcmp("--bind", arg) == 0 || strcmp("-b", arg) == 0) {
+    if (strcmp("--bind", arg) == 0 || strcmp("-n", arg) == 0) {
       if (i + 1 > argc) {
         help(argv[0]);
       }
       ip = argv[++i];
-    } else if (strcmp("--port", arg) == 0 || strcmp("-p", arg) == 0) {
+    } else if (strcmp("--port", arg) == 0 || strcmp("-t", arg) == 0) {
       if (i + 1 > argc) {
         help(argv[0]);
       }
@@ -1001,6 +1043,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Unable to determine cassandra version or parititioner");
     exit(1);
   }
+
+  print("Listening on %s:%d (version: %s, partitioner: %s)\n",
+        ip, port, cassandra_version, cassandra_parititioner);
 
   uv_ip4_addr(ip, port, &addr);
 

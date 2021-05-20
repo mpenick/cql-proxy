@@ -935,7 +935,7 @@ void on_prepare(uv_prepare_t *handle) {
 }
 
 void help(const char *prog) {
-  fprintf(stderr, "%s --bundle|-b --username|-u --password|p [--bind|-b <ip>] [--port|-p <port>]\n", prog);
+  fprintf(stderr, "%s --bundle|-b --username|-u --password|-p [--bind|-b <ip>] [--port|-p <port>]\n", prog);
   exit(1);
 }
 

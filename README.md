@@ -21,16 +21,16 @@ Repo: https://github.com/mpenick/cql-proxy
 cql-proxy --bundle <your-secure-connect-zip> --username token --password <your-astra-token>
 ```
 
-Connect to your Astra cluster using `127.0.0.1:9042`. `cqlsh` just works!
+Connect to your [DataStax Astra][astra] cluster using `127.0.0.1:9042`. `cqlsh` just works!
 
 ## Benefits
 
-* Enables community drivers and legacy DataStax drivers to seemlessly work with Astra without modification.
+* Enables community drivers and legacy DataStax drivers to seemlessly work with [DataStax Astra][astra] without modification.
   * gocql
   * rust-driver
   * lua-cassandra
   * ...
-* Existing C*/DSE applications can move to Astra without any modification.
+* Existing C*/DSE applications can move to [DataStax Astra][astra] without any modification.
 
 ## Future ideas
   
@@ -42,3 +42,5 @@ Connect to your Astra cluster using `127.0.0.1:9042`. `cqlsh` just works!
 * Very alpha, held together with duct tape and glue (it may crash!)
 * Need to handle the `USE <keyspace>` problem. Session per keyspace?
 * Many opportunites to harden and optimize (reduce allocations, granular locking, batched I/O)
+
+[astra]: https://astra.datastax.com/

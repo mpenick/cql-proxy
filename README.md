@@ -27,7 +27,7 @@ Connect to your Astra cluster using `127.0.0.1:9042`. `cqlsh` just works!
 
 * Enables community drivers and legacy DataStax drivers to seemlessly work with Astra without modification.
   * gocql
-  * <redacted>-rust-driver :)
+  * rust-driver
   * lua-cassandra
   * ...
 * Existing C*/DSE applications can move to Astra without any modification.

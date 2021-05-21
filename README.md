@@ -34,7 +34,6 @@ Connect to your Astra cluster using `127.0.0.1:9042`. `cqlsh` just works!
 
 ## Future ideas
   
-* Transparently handle multi-region failover (Possibly use prepared queries to determine if queries are idempotent automatically)
 * Allows for "connect", "query", "close" style drivers
 * OSS posibilities: Automatic token-aware routing, cache prepared statements
   

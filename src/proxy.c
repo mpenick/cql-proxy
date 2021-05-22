@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "parse.h"
 #include "raw.h"
 #include "serde.h"
 
@@ -589,18 +590,37 @@ void do_prepare(client_t *client) {
   primary_keys_t pks = {0};
 
   print("prepare: %s\n", query);
-  if (strstr(query, SELECT_LOCAL) != NULL) {
-    char body[512];
-    char *pos = encode_prepared(body, SELECT_LOCAL, "system", "local",
-                                &bind_markers, &pks, &local_columns);
-    write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
-  } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-  } else if (strstr(query, SELECT_PEERS) != NULL) {
-    char body[512];
-    char *pos = encode_prepared(body, SELECT_PEERS, "system", "peers",
-                                &bind_markers, &pks, &peers_columns);
-    write_response_body(client, CQL_OPCODE_PREPARE, client->frame.stream, body, (size_t)(pos - body));
+
+  statement_t stmt;
+  if (parse(&stmt, query, (size_t)len)) {
+    switch (stmt.type) {
+      case STMT_SELECT:
+        switch (stmt.table_type) {
+          case TK_LOCAL: {
+            char body[512];
+            char *pos = encode_prepared(body, SELECT_LOCAL, "system", "local",
+                                        &bind_markers, &pks, &local_columns);
+            write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+            }
+            break;
+          case TK_PEERS: {
+            char body[512];
+            char *pos = encode_prepared(body, SELECT_PEERS, "system", "peers",
+                                        &bind_markers, &pks, &peers_columns);
+            write_response_body(client, CQL_OPCODE_PREPARE, client->frame.stream, body, (size_t)(pos - body));
+            }
+            break;
+          case TK_PEERS_V2:
+            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+            break;
+          default:
+            assert("Invalid system table" && false);
+        }
+        break;
+      case STMT_USE:
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon.");
+        break;
+    }
   } else {
     do_request(client);
   }
@@ -665,12 +685,28 @@ void do_query(client_t *client) {
 
   print("query: %s\n", query);
 
-  if (strstr(query, SELECT_LOCAL) != NULL) {
-    write_system_local(client);
-  } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-  } else if (strstr(query, SELECT_PEERS) != NULL) {
-    write_system_peers(client);
+  statement_t stmt;
+  if (parse(&stmt, query, (size_t)len)) {
+    switch (stmt.type) {
+      case STMT_SELECT:
+        switch (stmt.table_type) {
+          case TK_LOCAL:
+            write_system_local(client);
+            break;
+          case TK_PEERS:
+            write_system_peers(client);
+            break;
+          case TK_PEERS_V2:
+            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+            break;
+          default:
+            assert("Invalid system table" && false);
+        }
+        break;
+      case STMT_USE:
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon.");
+        break;
+    }
   } else {
     do_request(client);
   }

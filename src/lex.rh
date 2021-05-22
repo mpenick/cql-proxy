@@ -1,0 +1,125 @@
+/*
+  Copyright (c) Michael Penick
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+*/
+#ifndef LEX_RH
+#define LEX_RH
+
+#include <string.h>
+#include <stdio.h>
+
+typedef enum {
+  TK_INVALID,
+  TK_TOO_BIG,
+  TK_SELECT,
+  TK_STAR,
+  TK_DOT,
+  TK_COMMA,
+  TK_FROM,
+  TK_SYSTEM,
+  TK_LOCAL,
+  TK_PEERS,
+  TK_PEERS_V2,
+  TK_USE,
+  TK_ID,
+  TK_EOF
+} token_t;
+
+typedef struct lex_s lex_t;
+
+struct lex_s {
+  const char* buf;
+  size_t buf_size;
+  const char* p;
+  const char* mark;
+  int line;
+  char val[128];
+};
+
+#define lex_mark(lex) lex->mark = lex->p
+#define lex_rewind(lex) lex->p = lex->mark
+
+%%{
+machine lex;
+write data;
+}%%
+
+static int copy_value(lex_t* lex, const char* ts, const char* te, int token) {
+  size_t token_size = te - ts;
+  if (token_size >= sizeof(lex->val)) { // need space for '\0'
+    return TK_TOO_BIG;
+  }
+  memcpy(lex->val, ts, token_size);
+  lex->val[token_size] = '\0';
+  return token;
+}
+
+void lex_init(lex_t* lex, const char* str, size_t len) {
+  lex->buf = str;
+  lex->buf_size = strlen(lex->buf);
+  lex->p = lex->buf;
+  lex->line = 1;
+}
+
+static token_t lex_next_token(lex_t* lex) {
+  token_t token = TK_INVALID;
+
+  const char* p = lex->p;
+  const char* pe = lex->buf + lex->buf_size;
+  const char* ts;
+  const char* te;
+  const char* eof = pe;
+  int cs, act;
+
+  if (p == eof) return TK_EOF;
+
+  lex->val[0] = '\0';
+
+  (void) lex_first_final;
+  (void) lex_error;
+  (void) lex_en_main;
+
+  %%{
+    ws = [ \t];
+    nl = '\r\n' | '\n';
+    id = ([a-zA-Z][a-zA-Z0-9_]*)|("\"" ([^\r\n\"] | "\\\"")* "\"");
+
+main := |*
+    '/select/i' => { token = TK_SELECT; fbreak; };
+    '/from/i' => { token = TK_FROM; fbreak; };
+    '/use/i' => { token = TK_USE; fbreak; };
+    '(system)|(\"system\")' => { token = TK_SYSTEM; fbreak; };
+    '(local)|(\"local\")' => { token = TK_LOCAL; fbreak; };
+    '(peers)|(\"peers\")' => { token = TK_PEERS; fbreak; };
+    '(peers_v2)|(\"peers_v2\")' => { token = TK_PEERS_V2; fbreak; };
+    '\*' => { token = TK_STAR; fbreak; };
+    ',' => { token = TK_COMMA; fbreak; };
+    '\.' => { token = TK_DOT; fbreak; };
+    id => { token = copy_value(lex, ts, te, TK_ID); fbreak; };
+    nl => { lex->line++; };
+    ws => { /* Skip */ };
+    any => { token = TK_INVALID; fbreak; };
+    *|;
+
+    write init;
+    write exec;
+  }%%
+
+  token = token == TK_INVALID && p == eof ? TK_EOF : token;
+  lex->p = p;
+
+  return token;
+}
+
+#endif // LEX_RH

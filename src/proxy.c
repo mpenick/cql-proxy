@@ -118,10 +118,9 @@
 #define VALUE_TYPE_SIMPLE 1
 #define VALUE_TYPE_COLL 2
 
-// TODO: Fix queries. Use fast recursive descent parser
+// TODO: Use actual hash of queries instead of these constants
 #define SELECT_LOCAL "system.local"
 #define SELECT_PEERS "system.peers"
-#define SELECT_PEERS_V2 "system.peers_v2"
 
 #define MAX_CLIENTS 128
 

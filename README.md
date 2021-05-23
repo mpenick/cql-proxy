@@ -10,7 +10,7 @@ Repo: https://hub.docker.com/repository/docker/mpenick/cql-proxy
 docker run \
   --mount type=bind,source=$(pwd)/<your-secure-connect-zip>,target=/secure-connect-bundle.zip \
   -e TOKEN=<your-astra-token> \
-  -p 127.0.0.1:9042:9042 mpenick/cql-proxy:v0.0.1
+  -p 127.0.0.1:9042:9042 mpenick/cql-proxy:latest
 ```
 
 Or, run it locally (after building it):

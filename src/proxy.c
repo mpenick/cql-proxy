@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "uthash.h"
+#include "picohash.h"
+
+#include "parse.h"
 #include "raw.h"
 #include "serde.h"
 
@@ -117,16 +121,10 @@
 #define VALUE_TYPE_SIMPLE 1
 #define VALUE_TYPE_COLL 2
 
-// TODO: Fix queries. Use fast recursive descent parser
-#define SELECT_LOCAL "system.local"
-#define SELECT_PEERS "system.peers"
-#define SELECT_PEERS_V2 "system.peers_v2"
-
 #define MAX_CLIENTS 128
 
 #define MAX_BATCH 64
 #define MAX_BATCH_SIZE 1024
-
 
 typedef struct column_type_s column_type_t;
 typedef struct value_s value_t;
@@ -135,6 +133,7 @@ typedef struct client_s client_t;
 typedef struct request_s request_t;
 typedef struct response_s response_t;
 typedef struct batch_s batch_t;
+typedef struct prepared_s prepared_t;
 
 static CassSession *session;
 static uv_async_t async;
@@ -378,12 +377,49 @@ typedef struct {
   uint16_t *pk_indexes;
 } primary_keys_t;
 
-char *encode_prepared(char *pos, const char *id, const char *keyspace,
+struct prepared_s {
+  char hash[PICOHASH_MD5_DIGEST_LENGTH];
+  char query[512];
+  statement_t stmt;
+  UT_hash_handle hh;
+};
+
+static prepared_t *prepared_cache = NULL;
+
+prepared_t *find_prepared(const char *hash) {
+  prepared_t *prepared;
+  HASH_FIND(hh, prepared_cache, hash, PICOHASH_MD5_DIGEST_LENGTH, prepared);
+  return prepared;
+}
+
+prepared_t *add_prepared(const char *query) {
+  prepared_t *prepared = malloc(sizeof(prepared_t));
+  strncpy(prepared->query, query, sizeof(prepared->query) - 1);
+
+  picohash_ctx_t ctx;
+  picohash_init_md5(&ctx);
+  picohash_update(&ctx, query, strlen(query));
+  picohash_final(&ctx, prepared->hash);
+
+  // Check for collisions?
+
+  prepared_t *existing = find_prepared(prepared->hash);
+  if (existing) {
+    HASH_DEL(prepared_cache, existing);
+    free(existing);
+  }
+
+  HASH_ADD(hh, prepared_cache, hash[0], PICOHASH_MD5_DIGEST_LENGTH, prepared);
+
+  return prepared;
+}
+
+char *encode_prepared(char *pos, prepared_t* prepared, const char *keyspace,
                       const char *table, const columns_t *bind_markers,
                       const primary_keys_t *pks, const columns_t *columns) {
-  pos = encode_int32(pos, CQL_RESULT_KIND_PREPARED);         // Kind
-  pos = encode_string(pos, id, strlen(id));                  // Id
-  pos = encode_int32(pos, CQL_RESULT_FLAG_GLOBAL_TABLESPEC); // Flags
+  pos = encode_int32(pos, CQL_RESULT_KIND_PREPARED);                // Kind
+  pos = encode_string(pos, prepared->hash, sizeof(prepared->hash)); // Id
+  pos = encode_int32(pos, CQL_RESULT_FLAG_GLOBAL_TABLESPEC);        // Flags
   pos = encode_int32(pos, bind_markers->count); // Bind marker column count
   pos = encode_int32(pos, pks->count);          // Primary key count
 
@@ -422,12 +458,11 @@ char *encode_prepared(char *pos, const char *id, const char *keyspace,
 
 static columns_t local_columns = {
     12,
-    (column_t[]){
+    (column_t[]){{.name = "key", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rpc_address", {.basic = CQL_TYPE_INET}},
                  {.name = "data_center", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "rack", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "tokens", {.basic = CQL_TYPE_SET, .sub_types = {CQL_TYPE_VARCHAR}}},
-                 {.name = "key", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "release_version", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "partitioner", {.basic = CQL_TYPE_VARCHAR}},
                  {.name = "cluster_name", {.basic = CQL_TYPE_VARCHAR}},
@@ -510,6 +545,7 @@ batch_t *alloc_batch(client_t *client) {
   return batch;
 }
 
+
 void close_client(client_t *client);
 void write_response_body(client_t *client, int8_t opcode, int16_t stream, const char *body, size_t body_size);
 void write_response_result(client_t *client, int16_t stream, const CassRawResult *result);
@@ -576,6 +612,58 @@ void do_request(client_t *client) {
   cass_future_set_callback(future, on_result, request);
 }
 
+int32_t find_column(const char* name, const columns_t *columns) {
+  for (int32_t i = 0; i < columns->count; ++i) {
+    if (strcmp(name, columns->columns[i].name) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void write_prepared(client_t *client, statement_t *stmt,
+                    const char *query, const char *keyspace,
+                    const char *table, const columns_t *bind_markers,
+                    const primary_keys_t *pks, const columns_t *columns) {
+  char body[1024];
+  prepared_t *prepared = add_prepared(query);
+  prepared->stmt = *stmt;
+
+  char *pos = NULL;
+  if (!stmt || (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_STAR)) {
+    pos = encode_prepared(body, prepared, keyspace, table, bind_markers, pks, columns);
+  } else if (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_COUNT) {
+    columns_t columns_meta = {
+      1,
+      (column_t[]){
+        {.name = "count", {.basic = CQL_TYPE_INT}}}};
+    pos = encode_prepared(body, prepared, keyspace, table, bind_markers, pks, &columns_meta);
+  } else {
+    int exprs_count = stmt->select.exprs_count;
+    if (exprs_count == 0) {
+      do_error(client, CQL_ERROR_INVALID_QUERY, "Invalid select expressions"); // TODO: Figure out C* error
+      return;
+    }
+    column_t columns_values[20];
+    for (int32_t i = 0; i < exprs_count; ++i) {
+      const statement_expr_t *expr = &stmt->select.exprs[i];
+      int32_t c = find_column(expr->id, columns);
+      if (c < 0) {
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Invalid column name"); // TODO: Figure out C* error
+        return;
+      }
+      columns_values[i] = local_columns.columns[c];
+      if (expr->type == STMT_EXPR_ALIAS) {
+        columns_values[i].name = expr->alias;
+      }
+    }
+    columns_t columns_meta = (columns_t){ exprs_count, columns_values };
+    pos = encode_prepared(body, prepared, keyspace, table, bind_markers, pks, &columns_meta);
+  }
+
+  write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+}
+
 void do_prepare(client_t *client) {
   char query[512];
   int32_t len = sizeof(query);
@@ -585,55 +673,123 @@ void do_prepare(client_t *client) {
     query[len] = '\0';
   }
 
-  columns_t bind_markers = {0};
+  columns_t bind_markers = {0}; // TODO?
   primary_keys_t pks = {0};
 
-  print("prepare: %s\n", query);
-  if (strstr(query, SELECT_LOCAL) != NULL) {
-    char body[512];
-    char *pos = encode_prepared(body, SELECT_LOCAL, "system", "local",
-                                &bind_markers, &pks, &local_columns);
-    write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
-  } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-  } else if (strstr(query, SELECT_PEERS) != NULL) {
-    char body[512];
-    char *pos = encode_prepared(body, SELECT_PEERS, "system", "peers",
-                                &bind_markers, &pks, &peers_columns);
-    write_response_body(client, CQL_OPCODE_PREPARE, client->frame.stream, body, (size_t)(pos - body));
+  statement_t stmt = {0};
+  if (parse(&stmt, query, (size_t)len)) {
+    switch (stmt.type) {
+      case STMT_SELECT:
+        switch (stmt.select.table_type) {
+          case TK_LOCAL: {
+            write_prepared(client, &stmt, query, "system", "local",
+                           &bind_markers, &pks, &local_columns);
+            }
+            break;
+          case TK_PEERS: {
+            write_prepared(client, &stmt, query, "system", "peers",
+                           &bind_markers, &pks, &peers_columns);
+            }
+            break;
+          case TK_PEERS_V2:
+            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+            break;
+          default:
+            assert("Invalid system table" && false);
+        }
+        break;
+      case STMT_USE:
+        // TODO: Does this support prepared?
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon.");
+        break;
+    }
   } else {
     do_request(client);
   }
 }
 
-void write_system_local(client_t *client) {
+
+void write_rows(client_t *client,
+                const statement_t *stmt,
+                const char *keyspace, const char *table,
+                const columns_t *columns, const rows_t *rows) {
+  char body[1024];
+
+  char* pos = NULL;
+  if (!stmt || (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_STAR)) {
+    pos = encode_rows(body, client->frame.flags & CQL_QUERY_FLAG_SKIP_METADATA,
+                            keyspace, table, columns, rows);
+  } else if (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_COUNT) {
+    columns_t count_columns = {
+      1,
+      (column_t[]){
+        {.name = "count", {.basic = CQL_TYPE_INT}}}};
+    rows_t count_rows = (rows_t){
+                  1,
+                  (row_t[]){{
+                  (value_t[]){
+    {.type = VALUE_TYPE_SIMPLE, .value = integer_value(stmt->select.table_type == TK_LOCAL ? 1 : 0)}}}}};
+    pos = encode_rows(body, client->frame.flags & CQL_QUERY_FLAG_SKIP_METADATA,
+                            keyspace, table, &count_columns, &count_rows);
+  } else {
+    int exprs_count = stmt->select.exprs_count;
+    if (exprs_count == 0) {
+      do_error(client, CQL_ERROR_INVALID_QUERY, "Invalid select expressions"); // TODO: Figure out C* error
+      return;
+    }
+
+    column_t columns_values[20];
+    value_t values[20];
+    for (int32_t i = 0; i < exprs_count; ++i) {
+      const statement_expr_t *expr = &stmt->select.exprs[i];
+      int32_t c = find_column(expr->id, columns);
+      if (c < 0) {
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Invalid column name"); // TODO: Figure out C* error
+        return;
+      }
+      columns_values[i] = columns->columns[c];
+      if (rows->count > 0) {
+        values[i] = rows->rows->columns[c];
+      }
+      if (expr->type == STMT_EXPR_ALIAS) {
+        columns_values[i].name = expr->alias;
+      }
+    }
+
+    columns_t selected_columns = (columns_t){ exprs_count, columns_values };
+    rows_t selected_rows = (rows_t){
+                  1,
+                  (row_t[]){{ values }}};
+    pos = encode_rows(body, client->frame.flags & CQL_QUERY_FLAG_SKIP_METADATA,
+                            keyspace, table, &selected_columns, rows->count > 0 ? &selected_rows : rows);
+  }
+  write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+}
+
+void write_system_local(client_t *client, const statement_t *stmt) {
   rows_t local_rows = (rows_t){
                       1,
                       (row_t[]){{
                       (value_t[]){
-  {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
-  {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
-  {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
-  {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("19e26944-ffb1-40a9-a184-a9b065e5e06b")}},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
+    {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")}, // TODO: Get the correct local IP
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
+    {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
+    {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
+    {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("19e26944-ffb1-40a9-a184-a9b065e5e06b")}},
+  }}};
 
-}}};
-  char body[512];
-  char *pos = encode_rows(body, false, "system", "local", &local_columns, &local_rows);
-  write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  write_rows(client, stmt, "system", "local", &local_columns, &local_rows);
 }
 
-void write_system_peers(client_t *client) {
-  char body[512];
-  char *pos = encode_rows(body, false, "system", "peers", &peers_columns, &empty_rows);
-  write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+void write_system_peers(client_t *client, const statement_t *stmt) {
+  write_rows(client, stmt, "system", "peers", &peers_columns, &empty_rows);
 }
 
 void do_execute(client_t *client) {
@@ -645,9 +801,27 @@ void do_execute(client_t *client) {
     id[len] = '\0';
   }
 
-  if (strcmp(id, SELECT_LOCAL) == 0) {
-    write_system_local(client);
-  } else if (strcmp(id, SELECT_PEERS) == 0) {
+  prepared_t * prepared = NULL;
+  if (len == PICOHASH_MD5_DIGEST_LENGTH) {
+    prepared = find_prepared(id);
+  }
+
+  if (prepared != NULL) {
+    const statement_t *stmt = &prepared->stmt;
+    if (stmt->type == STMT_SELECT) {
+        switch (stmt->select.table_type) {
+          case TK_LOCAL:
+            write_system_local(client, stmt);
+            break;
+          case TK_PEERS:
+            write_system_peers(client, stmt);
+            break;
+          default:
+            assert("Invalid system table" && false);
+        }
+    } else {
+      assert("Unsupported prepared statement type" && false);
+    }
   } else {
     do_request(client);
   }
@@ -663,14 +837,28 @@ void do_query(client_t *client) {
     query[len] = '\0';
   }
 
-  print("query: %s\n", query);
-
-  if (strstr(query, SELECT_LOCAL) != NULL) {
-    write_system_local(client);
-  } else if (strstr(query, SELECT_PEERS_V2) != NULL) {
-    do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-  } else if (strstr(query, SELECT_PEERS) != NULL) {
-    write_system_peers(client);
+  statement_t stmt = {0};
+  if (parse(&stmt, query, (size_t)len)) {
+    switch (stmt.type) {
+      case STMT_SELECT:
+        switch (stmt.select.table_type) {
+          case TK_LOCAL:
+            write_system_local(client, &stmt);
+            break;
+          case TK_PEERS:
+            write_system_peers(client, &stmt);
+            break;
+          case TK_PEERS_V2:
+            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+            break;
+          default:
+            assert("Invalid system table" && false);
+        }
+        break;
+      case STMT_USE:
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon...");
+        break;
+    }
   } else {
     do_request(client);
   }
@@ -688,7 +876,6 @@ void on_write(uv_write_t *req, int status) {
 void on_frame_header_done(frame_t *frame) {
   client_t *client = (client_t *)frame->user_data;
   if (frame->version < 3 || frame->version > 4) {
-    print("protocol: %d\n", frame->version);
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Invalid or unsupported protocol version");
   } else if (frame->length > (int32_t)sizeof(client->body)) {
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Frame body is too big");
@@ -833,7 +1020,6 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
 }
 
 void on_close(uv_handle_t *handle) {
-  //print("Client closed\n");
   client_t *client = (client_t *)handle->data;
   // TODO: Clean up in-flight?
   free(client);
@@ -868,8 +1054,6 @@ void on_connection(uv_stream_t *server, int status) {
 
   rc = uv_accept(server, (uv_stream_t *)&client->tcp);
   assert(rc == 0 && "Unable to accept client connection");
-
-  //print("Client connection\n");
 
   client->batch = NULL;
   client->batch_count = 0;
@@ -1040,7 +1224,7 @@ int main(int argc, char **argv) {
 
   if (!cassandra_version || !cassandra_parititioner) {
     cass_session_free(session);
-    fprintf(stderr, "Unable to determine cassandra version or parititioner");
+    fprintf(stderr, "Unable to determine Cassandra version or partitioner");
     exit(1);
   }
 

@@ -83,9 +83,8 @@ static token_t parse_expr(statement_t *stmt, lex_t* lex, token_t token) {
     if (token == TK_AS) {
       token = lex_next_token(lex);
       if (token != TK_ID) {
-        return token;
+        return TK_EOF;
       }
-      statement_expr_t *expr = next_expr(stmt);
       if (expr) {
         expr->type = STMT_EXPR_ALIAS;
         strncpy(expr->alias, lex->val, sizeof(expr->alias) - 1);
@@ -105,21 +104,23 @@ static token_t parse_expr(statement_t *stmt, lex_t* lex, token_t token) {
   } else if (token == TK_COUNT) {
     token = lex_next_token(lex);
     if (token != TK_LPAREN) {
-      return token;
+      return TK_EOF;
     }
     token = lex_next_token(lex);
     if (token != TK_STAR && token != TK_ID) {
-      return token;
+      return TK_EOF;
     }
     token = lex_next_token(lex);
     if (token != TK_RPAREN) {
-      return token;
+      return TK_EOF;
     }
     statement_expr_t *expr = next_expr(stmt);
     if (expr) {
       expr->type = STMT_EXPR_COUNT;
     }
     token = lex_next_token(lex);
+  } else {
+    return TK_EOF;
   }
   return token;
 }
@@ -160,6 +161,8 @@ static bool parse_select(statement_t *stmt, lex_t* lex) {
     token = parse_expr(stmt, lex, token);
     if (token == TK_COMMA) {
       token = lex_next_token(lex);
+    } else {
+
     }
   }
 

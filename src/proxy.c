@@ -590,11 +590,11 @@ void do_prepare(client_t *client) {
 
   print("prepare: %s\n", query);
 
-  statement_t stmt;
+  statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
     switch (stmt.type) {
       case STMT_SELECT:
-        switch (stmt.table_type) {
+        switch (stmt.select.table_type) {
           case TK_LOCAL: {
             char body[512];
             char *pos = encode_prepared(body, SELECT_LOCAL, "system", "local",
@@ -625,31 +625,81 @@ void do_prepare(client_t *client) {
   }
 }
 
-void write_system_local(client_t *client) {
+
+int32_t find_column(const char* name, columns_t *columns) {
+  for (int32_t i = 0; i < columns->count; ++i) {
+    if (strcmp(name, columns->columns[i].name) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void write_system_local(client_t *client, statement_t *stmt) {
   rows_t local_rows = (rows_t){
                       1,
                       (row_t[]){{
                       (value_t[]){
-  {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
-  {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
-  {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
-  {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
-  {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("19e26944-ffb1-40a9-a184-a9b065e5e06b")}},
+    {.type = VALUE_TYPE_SIMPLE, .value = inet_value("127.0.0.1")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("dc1")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("rack1")},
+    {.type = VALUE_TYPE_COLL, .coll = {1, (bytes_t[]){varchar_value("0")}}},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("local")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_version)},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value(cassandra_parititioner)},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("cql-proxy")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("3.0.0")},
+    {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("4f2b29e6-59b5-4e2d-8fd6-01e32e67f0d7")},
+    {.type = VALUE_TYPE_SIMPLE, .value = varchar_value("4")},
+    {.type = VALUE_TYPE_SIMPLE, .value = uuid_value("19e26944-ffb1-40a9-a184-a9b065e5e06b")}},
+  }}};
 
-}}};
-  char body[512];
-  char *pos = encode_rows(body, false, "system", "local", &local_columns, &local_rows);
-  write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  if (!stmt || (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_STAR)) {
+    char body[512];
+    char *pos = encode_rows(body, false, "system", "local", &local_columns, &local_rows);
+    write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  } else if (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_COUNT) {
+    columns_t columns_meta = {
+      1,
+      (column_t[]){
+        {.name = "count", {.basic = CQL_TYPE_INT}}}};
+    rows_t rows = (rows_t){
+                  1,
+                  (row_t[]){{
+                  (value_t[]){
+    {.type = VALUE_TYPE_SIMPLE, .value = integer_value(1)}}}}};
+    char body[512];
+    char *pos = encode_rows(body, false, "system", "local", &columns_meta, &rows);
+    write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  } else {
+    int exprs_count = stmt->select.exprs_count;
+    if (exprs_count == 0) {
+      do_error(client, CQL_ERROR_INVALID_QUERY, "No select expressions"); // TODO: Figure out C* error
+    }
+
+    column_t columns[20];
+    value_t values[20];
+    for (int32_t i = 0; i < exprs_count; ++i) {
+      int32_t c = find_column(stmt->select.exprs[i].id, &local_columns);
+      if (c < 0) {
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Invalid column name"); // TODO: Figure out C* error
+        return;
+      }
+      columns[i] = local_columns.columns[c];
+      values[i] = local_rows.rows->columns[c];
+    }
+
+    columns_t columns_meta = (columns_t){ exprs_count, columns };
+    rows_t rows = (rows_t){
+                  1,
+                  (row_t[]){{ values }}};
+    char body[512];
+    char *pos = encode_rows(body, false, "system", "local", &columns_meta, &rows);
+    write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
+  }
 }
 
-void write_system_peers(client_t *client) {
+void write_system_peers(client_t *client, statement_t *stmt) {
   char body[512];
   char *pos = encode_rows(body, false, "system", "peers", &peers_columns, &empty_rows);
   write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
@@ -665,8 +715,9 @@ void do_execute(client_t *client) {
   }
 
   if (strcmp(id, SELECT_LOCAL) == 0) {
-    write_system_local(client);
+    write_system_local(client, NULL);
   } else if (strcmp(id, SELECT_PEERS) == 0) {
+    write_system_peers(client, NULL);
   } else {
     do_request(client);
   }
@@ -684,16 +735,16 @@ void do_query(client_t *client) {
 
   print("query: %s\n", query);
 
-  statement_t stmt;
+  statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
     switch (stmt.type) {
       case STMT_SELECT:
-        switch (stmt.table_type) {
+        switch (stmt.select.table_type) {
           case TK_LOCAL:
-            write_system_local(client);
+            write_system_local(client, &stmt);
             break;
           case TK_PEERS:
-            write_system_peers(client);
+            write_system_peers(client, &stmt);
             break;
           case TK_PEERS_V2:
             do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
@@ -703,7 +754,7 @@ void do_query(client_t *client) {
         }
         break;
       case STMT_USE:
-        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon.");
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon...");
         break;
     }
   } else {

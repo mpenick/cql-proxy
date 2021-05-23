@@ -121,10 +121,6 @@
 #define VALUE_TYPE_SIMPLE 1
 #define VALUE_TYPE_COLL 2
 
-// TODO: Use actual hash of queries instead of these constants
-#define SELECT_LOCAL "system.local"
-#define SELECT_PEERS "system.peers"
-
 #define MAX_CLIENTS 128
 
 #define MAX_BATCH 64
@@ -680,8 +676,6 @@ void do_prepare(client_t *client) {
   columns_t bind_markers = {0}; // TODO?
   primary_keys_t pks = {0};
 
-  print("prepare: %s\n", query);
-
   statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
     switch (stmt.type) {
@@ -754,7 +748,9 @@ void write_rows(client_t *client,
         return;
       }
       columns_values[i] = columns->columns[c];
-      values[i] = rows->rows->columns[c];
+      if (rows->count > 0) {
+        values[i] = rows->rows->columns[c];
+      }
       if (expr->type == STMT_EXPR_ALIAS) {
         columns_values[i].name = expr->alias;
       }
@@ -765,7 +761,7 @@ void write_rows(client_t *client,
                   1,
                   (row_t[]){{ values }}};
     pos = encode_rows(body, client->frame.flags & CQL_QUERY_FLAG_SKIP_METADATA,
-                            keyspace, table, &selected_columns, &selected_rows);
+                            keyspace, table, &selected_columns, rows->count > 0 ? &selected_rows : rows);
   }
   write_response_body(client, CQL_OPCODE_RESULT, client->frame.stream, body, (size_t)(pos - body));
 }
@@ -841,8 +837,6 @@ void do_query(client_t *client) {
     query[len] = '\0';
   }
 
-  print("query: %s\n", query);
-
   statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
     switch (stmt.type) {
@@ -882,7 +876,6 @@ void on_write(uv_write_t *req, int status) {
 void on_frame_header_done(frame_t *frame) {
   client_t *client = (client_t *)frame->user_data;
   if (frame->version < 3 || frame->version > 4) {
-    print("protocol: %d\n", frame->version);
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Invalid or unsupported protocol version");
   } else if (frame->length > (int32_t)sizeof(client->body)) {
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Frame body is too big");
@@ -1027,7 +1020,6 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
 }
 
 void on_close(uv_handle_t *handle) {
-  //print("Client closed\n");
   client_t *client = (client_t *)handle->data;
   // TODO: Clean up in-flight?
   free(client);
@@ -1062,8 +1054,6 @@ void on_connection(uv_stream_t *server, int status) {
 
   rc = uv_accept(server, (uv_stream_t *)&client->tcp);
   assert(rc == 0 && "Unable to accept client connection");
-
-  //print("Client connection\n");
 
   client->batch = NULL;
   client->batch_count = 0;
@@ -1234,7 +1224,7 @@ int main(int argc, char **argv) {
 
   if (!cassandra_version || !cassandra_parititioner) {
     cass_session_free(session);
-    fprintf(stderr, "Unable to determine cassandra version or parititioner");
+    fprintf(stderr, "Unable to determine Cassandra version or partitioner");
     exit(1);
   }
 

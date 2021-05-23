@@ -2,6 +2,8 @@
 
 A *client-side*  CQL proxy/sidecar. It listens on a local address and securely forwards your application's CQL traffic.
 
+![cql-proxy](cql-proxy.png)
+
 Run using `docker`:
 
 Repo: https://hub.docker.com/repository/docker/mpenick/cql-proxy

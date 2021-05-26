@@ -126,24 +126,42 @@
 #define MAX_BATCH 64
 #define MAX_BATCH_SIZE 1024
 
+#define MAX_QUEUED 64
+
+#define MAX_FRAME_SIZE 8388608 // 8MB
+#define MAX_BODY_INLINED 8192 // 8KB
+
 typedef struct column_type_s column_type_t;
 typedef struct value_s value_t;
 
 typedef struct client_s client_t;
+typedef struct client_queue_s client_queue_t;
 typedef struct request_s request_t;
 typedef struct response_s response_t;
 typedef struct batch_s batch_t;
 typedef struct prepared_s prepared_t;
+typedef struct session_s session_t;
+typedef struct queued_s queued_t;
 
 static CassSession *session;
+static CassCluster *cluster;
+
 static uv_async_t async;
 static uv_prepare_t prepare;
 static const char *cassandra_version = NULL;
 static const char *cassandra_parititioner = NULL;
 
-static client_t *to_flush[MAX_CLIENTS];
-static size_t to_flush_count = 0;
-static uv_mutex_t to_flush_mutex;
+typedef void (*client_queue_cb)(client_t *client);
+
+struct client_queue_s {
+  client_t *clients[MAX_CLIENTS];
+  size_t count;
+  uv_mutex_t mutex;
+};
+
+static client_queue_t to_flush;
+static client_queue_t use_keyspace_success;
+static client_queue_t use_keyspace_failed;
 
 struct column_type_s {
   int16_t basic;
@@ -319,7 +337,7 @@ char *encode_row(char *pos, int32_t column_count, const row_t *row) {
       pos = encode_int32(pos, -1);
       break;
     case VALUE_TYPE_SIMPLE:
-      pos = encode_long_string(pos, column->value.data, column->value.len);
+      pos = encode_long_string(pos, column->value.data, (size_t)column->value.len);
       break;
     case VALUE_TYPE_COLL:
       pos = encode_collection(pos, &column->coll);
@@ -372,6 +390,20 @@ char *encode_rows(char *pos, bool no_metadata, const char *keyspace,
   return pos;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define ATTRIBUTE_FORMAT(string, first) __attribute__((__format__(__printf__, string, first)))
+#else
+#define ATTRIBUTE_FORMAT(string, first)
+#endif
+
+ATTRIBUTE_FORMAT(1, 2)
+static void print(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  vfprintf(stdout, format, args); fflush(stdout);
+  va_end(args);
+}
+
 typedef struct {
   int32_t count;
   uint16_t *pk_indexes;
@@ -412,6 +444,76 @@ prepared_t *add_prepared(const char *query) {
   HASH_ADD(hh, prepared_cache, hash[0], PICOHASH_MD5_DIGEST_LENGTH, prepared);
 
   return prepared;
+}
+
+
+struct session_s {
+  char keyspace [64];
+  bool is_connected;
+  CassSession *session;
+  UT_hash_handle hh;
+};
+
+static session_t *session_cache = NULL;
+
+session_t *find_session(const char* keyspace) {
+  session_t *session = NULL;
+  HASH_FIND_STR(session_cache, keyspace, session);
+  return session;
+}
+
+session_t *get_session(const char* keyspace) {
+  session_t *existing = find_session(keyspace);
+  if (existing) {
+    return existing;
+  }
+
+  session_t *session = malloc(sizeof(session_t));
+  strncpy(session->keyspace, keyspace, sizeof(session->keyspace) - 1);
+  session->is_connected = false;
+  session->session = cass_session_new();
+
+  HASH_ADD_STR(session_cache, keyspace, session);
+
+  return session;
+}
+
+void init_client_queue(client_queue_t* queue) {
+  queue->count = 0;
+  uv_mutex_init(&queue->mutex);
+}
+
+// Thread-safe
+void add_to_client_queue(client_queue_t *queue, client_t *client) {
+  uv_mutex_lock(&queue->mutex);
+  for (size_t i = 0; i < queue->count; ++i) {
+    if (queue->clients[i] == client) {
+      uv_mutex_unlock(&queue->mutex);
+      return;
+    }
+  }
+  queue->clients[queue->count++] = client;
+  uv_mutex_unlock(&queue->mutex);
+  uv_async_send(&async);
+}
+
+// Thread-safe
+void process_client_queue(client_queue_t* queue, client_queue_cb cb) {
+  client_t *copy[MAX_CLIENTS];
+  size_t count = 0;
+
+  uv_mutex_lock(&queue->mutex);
+  count = queue->count;
+  for (size_t i = 0;  i < count; ++i) {
+    copy[i] = queue->clients[i];
+  }
+  queue->count = 0;
+  uv_mutex_unlock(&queue->mutex);
+
+
+  for (size_t i = 0; i < count; ++i) {
+    cb(copy[i]);
+  }
 }
 
 char *encode_prepared(char *pos, prepared_t* prepared, const char *keyspace,
@@ -485,17 +587,28 @@ static columns_t peers_columns = {
 
 static rows_t empty_rows = {0};
 
+struct queued_s {
+  frame_t frame;
+  char* body;
+  char keyspace[64];
+};
+
 struct client_s {
   uv_tcp_t tcp;
   char data[64 * 1024];
-  char body[8192];
+  char *body;
+  char body_inline[MAX_BODY_INLINED];
   char *body_pos;
+  char keyspace[64];
   frame_t frame;
   batch_t *batch;
   batch_t *batches[MAX_BATCH];
   size_t batch_count;
   uv_mutex_t mutex;
   bool is_closing;
+  queued_t queued[MAX_QUEUED];
+  size_t queued_count;
+  int16_t use_keyspace_stream;
 };
 
 struct request_s {
@@ -521,20 +634,6 @@ struct batch_s {
   client_t *client;
   batch_t *next;
 };
-
-#if defined(__GNUC__) || defined(__clang__)
-#define ATTRIBUTE_FORMAT(string, first) __attribute__((__format__(__printf__, string, first)))
-#else
-#define ATTRIBUTE_FORMAT(string, first)
-#endif
-
-ATTRIBUTE_FORMAT(1, 2)
-static void print(const char *format, ...) {
-  va_list args;
-  va_start(args, format);
-  vfprintf(stdout, format, args); fflush(stdout);
-  va_end(args);
-}
 
 batch_t *alloc_batch(client_t *client) {
   batch_t *batch;
@@ -602,10 +701,41 @@ void on_result(CassFuture *future, void *data) {
   cass_future_free(future);
 }
 
-void do_request(client_t *client) {
-  CassFuture *future =  cass_session_execute_raw(session,
-                                                 (cass_uint8_t)client->frame.opcode, (cass_uint8_t)client->frame.flags,
-                                                 client->body, (size_t)client->frame.length);
+void queue_request(client_t* client) {
+  if (client->queued_count == MAX_QUEUED) {
+    do_error(client, CQL_ERROR_OVERLOADED, "Unable to handle request");
+    uv_mutex_unlock(&client->mutex);
+    return;
+  }
+  queued_t* entry = &client->queued[client->queued_count++];
+
+  entry->frame = client->frame;
+  entry->body = malloc((size_t)client->frame.length);
+  memcpy(entry->body, client->body, (size_t)client->frame.length);
+}
+
+void do_request(client_t *client, frame_t* frame, char* body) {
+  CassSession* connected_session = session;
+
+  if (strlen(client->keyspace) > 0) {
+    session_t* s = find_session(client->keyspace);
+    if (s) {
+      if (s->is_connected) {
+        connected_session = s->session;
+      } else {
+        uv_read_stop((uv_stream_t *)&client->tcp);
+        queue_request(client);
+        return;
+      }
+    } else {
+      do_error(client, CQL_ERROR_SERVER_ERROR, "Unable to find session for keyspace");
+      return;
+    }
+  }
+
+  CassFuture *future =  cass_session_execute_raw(connected_session,
+                                                 (cass_uint8_t)frame->opcode, (cass_uint8_t)frame->flags,
+                                                 body, (size_t)frame->length);
   request_t *request = malloc(sizeof(request_t));
   request->client = client;
   request->stream = client->frame.stream;
@@ -665,8 +795,8 @@ void write_prepared(client_t *client, statement_t *stmt,
 }
 
 void do_prepare(client_t *client) {
-  char query[512];
-  int32_t len = sizeof(query);
+  char query[512] = {0};
+  int32_t len = sizeof(query) - 1;
 
   { // Decode
     decode_long_string(client->body, query, &len);
@@ -678,36 +808,48 @@ void do_prepare(client_t *client) {
 
   statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
+
     switch (stmt.type) {
       case STMT_SELECT:
-        switch (stmt.select.table_type) {
-          case TK_LOCAL: {
-            write_prepared(client, &stmt, query, "system", "local",
-                           &bind_markers, &pks, &local_columns);
+        if (stmt.select.is_table && strcmp(client->keyspace, "system") != 0) {
+          do_request(client, &client->frame, client->body);
+        } else {
+          switch (stmt.select.table_type) {
+            case TK_LOCAL: {
+              write_prepared(client, &stmt, query, "system", "local",
+                             &bind_markers, &pks, &local_columns);
             }
-            break;
-          case TK_PEERS: {
-            write_prepared(client, &stmt, query, "system", "peers",
-                           &bind_markers, &pks, &peers_columns);
+              break;
+            case TK_PEERS: {
+              write_prepared(client, &stmt, query, "system", "peers",
+                             &bind_markers, &pks, &peers_columns);
             }
-            break;
-          case TK_PEERS_V2:
-            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-            break;
-          default:
-            assert("Invalid system table" && false);
+              break;
+            case TK_PEERS_V2:
+              do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+              break;
+            default:
+              do_request(client, &client->frame, client->body);
+              break;
+          }
         }
         break;
       case STMT_USE:
-        // TODO: Does this support prepared?
-        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon.");
+        do_error(client, CQL_ERROR_INVALID_QUERY, "Cannot prepare \"USE <keyspace\"");
         break;
     }
   } else {
-    do_request(client);
+    do_request(client, &client->frame, client->body);
   }
 }
 
+
+void write_set_keyspace(client_t *client, int16_t stream) {
+  char body[128];
+  char* pos = encode_int32(body, CQL_RESULT_KIND_SET_KEYSPACE); // Kind
+  pos = encode_string(pos, client->keyspace, strlen(client->keyspace)); // Keyspace
+  write_response_body(client, CQL_OPCODE_RESULT, stream, body, (size_t)(pos - body));
+}
 
 void write_rows(client_t *client,
                 const statement_t *stmt,
@@ -823,44 +965,76 @@ void do_execute(client_t *client) {
       assert("Unsupported prepared statement type" && false);
     }
   } else {
-    do_request(client);
+    do_request(client, &client->frame, client->body);
+  }
+}
+
+void on_session_connected(CassFuture *future, void *data) {
+  client_t *client = (client_t*)data;
+  CassError rc = cass_future_error_code(future);
+  if (rc != CASS_OK) {
+    const char *message;
+    size_t message_length;
+    cass_future_error_message(future, &message, &message_length);
+    int32_t code = rc == CASS_ERROR_LIB_UNABLE_TO_SET_KEYSPACE ? CQL_ERROR_INVALID_QUERY : CQL_ERROR_SERVER_ERROR;
+    write_error(client, client->use_keyspace_stream, code, message, message_length);
+    add_to_client_queue(&use_keyspace_failed, client);
+  } else {
+    write_set_keyspace(client, client->use_keyspace_stream);
+    add_to_client_queue(&use_keyspace_success, client);
+  }
+}
+
+void do_use_keyspace(client_t *client, statement_t *stmt) {
+  session_t* s = get_session(stmt->use.keyspace);
+  if (client->use_keyspace_stream >= 0) {
+    do_error(client, CQL_ERROR_OVERLOADED, "Use keyspace already in progress");
+    return;
+  }
+  strncpy(client->keyspace, stmt->use.keyspace, sizeof(client->keyspace) - 1);
+  if (s->is_connected) {
+    write_set_keyspace(client, client->frame.stream);
+  } else {
+    CassFuture *future = cass_session_connect_keyspace(s->session, cluster, stmt->use.keyspace);
+    client->use_keyspace_stream = client->frame.stream;
+    cass_future_set_callback(future, on_session_connected, client);
   }
 }
 
 
 void do_query(client_t *client) {
-  char query[512];
-  int32_t len = sizeof(query);
-
-  { // Decode
-    decode_long_string(client->body, query, &len);
-    query[len] = '\0';
-  }
+  int32_t len = 0;
+  const char *query = decode_int32(client->body, &len);
 
   statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
     switch (stmt.type) {
       case STMT_SELECT:
-        switch (stmt.select.table_type) {
-          case TK_LOCAL:
-            write_system_local(client, &stmt);
-            break;
-          case TK_PEERS:
-            write_system_peers(client, &stmt);
-            break;
-          case TK_PEERS_V2:
-            do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
-            break;
-          default:
-            assert("Invalid system table" && false);
+        if (stmt.select.is_table && strcmp(client->keyspace, "system") != 0) {
+          do_request(client, &client->frame, client->body);
+        } else {
+          switch (stmt.select.table_type) {
+            case TK_LOCAL:
+              write_system_local(client, &stmt);
+              break;
+            case TK_PEERS:
+              write_system_peers(client, &stmt);
+              break;
+            case TK_PEERS_V2:
+              do_error(client, CQL_ERROR_INVALID_QUERY, "Doesn't exist");
+              break;
+            default:
+              do_request(client, &client->frame, client->body);
+              break;
+          }
         }
         break;
       case STMT_USE:
-        do_error(client, CQL_ERROR_INVALID_QUERY, "Not yet supported by cql-proxy. Soon...");
+        do_use_keyspace(client, &stmt);
         break;
     }
   } else {
-    do_request(client);
+    do_request(client, &client->frame, client->body);
   }
 }
 
@@ -875,12 +1049,21 @@ void on_write(uv_write_t *req, int status) {
 
 void on_frame_header_done(frame_t *frame) {
   client_t *client = (client_t *)frame->user_data;
+
+  client->body = client->body_inline;
+
   if (frame->version < 3 || frame->version > 4) {
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Invalid or unsupported protocol version");
-  } else if (frame->length > (int32_t)sizeof(client->body)) {
+  } else if (frame->length < 0) {
+    do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Frame length is invalid");
+    close_client(client);
+  } else if (frame->length > MAX_FRAME_SIZE) {
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Frame body is too big");
     close_client(client);
+  } else if (frame->length > (int32_t)sizeof(client->body_inline)) {
+    client->body = malloc((size_t)frame->length);
   }
+
   client->body_pos = client->body;
 }
 
@@ -914,6 +1097,10 @@ void on_frame_done(frame_t *frame) {
     do_error(client, CQL_ERROR_PROTOCOL_ERROR, "Unsupported operation");
     break;
   }
+
+  if (client->body != client->body_inline) {
+    free(client->body);
+  }
 }
 
 
@@ -921,18 +1108,29 @@ void on_response_body_free(response_t *response) {
   free(response->body);
 }
 
-// Thread-safe
-void add_to_flush(client_t *client) {
-  uv_mutex_lock(&to_flush_mutex);
-  for (size_t i = 0; i < to_flush_count; ++i) {
-    if (to_flush[i] == client) {
-      uv_mutex_unlock(&to_flush_mutex);
-      return;
-    }
+void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+
+void process_queued(client_t *client) {
+  client->use_keyspace_stream = -1;
+  for (size_t i = 0; i < client->queued_count; ++i) {
+    queued_t *queued = &client->queued[i];
+    do_request(client, &queued->frame, queued->body);
+    free(queued->body);
   }
-  to_flush[to_flush_count++] = client;
-  uv_mutex_unlock(&to_flush_mutex);
-  uv_async_send(&async);
+  uv_read_start((uv_stream_t *)&client->tcp, on_alloc, on_read);
+  client->queued_count = 0;
+}
+
+void set_keyspace(client_t *client) {
+  session_t *session = find_session(client->keyspace);
+  assert(session != NULL && "No session for keyspace");
+  session->is_connected = true;
+  process_queued(client);
+}
+
+void set_keyspace_failed(client_t *client) {
+  client->keyspace[0] = '\0';
+  process_queued(client);
 }
 
 // Thread-safe
@@ -946,16 +1144,6 @@ void flush_client(client_t *client) {
   client->batch = NULL;
   client->batch_count = 0;
   uv_mutex_unlock(&client->mutex);
-}
-
-// Thread-safe
-void flush() {
-  uv_mutex_lock(&to_flush_mutex);
-  for (size_t i = 0; i < to_flush_count; ++i) {
-    flush_client(to_flush[i]);
-  }
-  to_flush_count = 0;
-  uv_mutex_unlock(&to_flush_mutex);
 }
 
 response_t *get_batch_reponse(client_t *client) {
@@ -993,7 +1181,7 @@ void write_response_body(client_t *client, int8_t opcode, int16_t stream, const 
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
 
-  add_to_flush(client);
+  add_to_client_queue(&to_flush, client);
 }
 
 void on_response_result_free(response_t *response) {
@@ -1016,7 +1204,7 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
 
-  add_to_flush(client);
+  add_to_client_queue(&to_flush, client);
 }
 
 void on_close(uv_handle_t *handle) {
@@ -1060,6 +1248,9 @@ void on_connection(uv_stream_t *server, int status) {
   client->tcp.data = client;
   client->frame.user_data = client;
   client->is_closing = false;
+  client->keyspace[0] = '\0';
+  client->queued_count = 0;
+  client->use_keyspace_stream = -1;
   uv_mutex_init(&client->mutex);
   frame_init_ex(&client->frame, on_frame_header_done, on_frame_body,
                 on_frame_done);
@@ -1092,8 +1283,6 @@ void print_error(const char *context, CassFuture *future) {
 
 bool connect_session(const char *bundle, const char *username, const char *password) {
   CassFuture *connect_future = NULL;
-  CassCluster *cluster;
-
   cluster = cass_cluster_new();
   session = cass_session_new();
 
@@ -1143,12 +1332,11 @@ bool connect_session(const char *bundle, const char *username, const char *passw
 
   cass_future_free(result_future);
   cass_future_free(connect_future);
-  cass_cluster_free(cluster);
   return true;
 error:
   cass_future_free(connect_future);
-  cass_cluster_free(cluster);
   cass_session_free(session);
+  cass_cluster_free(cluster);
   return false;
 }
 
@@ -1157,7 +1345,9 @@ void on_async(uv_async_t *handle) {
 }
 
 void on_prepare(uv_prepare_t *handle) {
-  flush();
+  process_client_queue(&to_flush, flush_client);
+  process_client_queue(&use_keyspace_failed, set_keyspace_failed);
+  process_client_queue(&use_keyspace_success, set_keyspace);
 }
 
 void help(const char *prog) {
@@ -1224,9 +1414,14 @@ int main(int argc, char **argv) {
 
   if (!cassandra_version || !cassandra_parititioner) {
     cass_session_free(session);
+    cass_cluster_free(cluster);
     fprintf(stderr, "Unable to determine Cassandra version or partitioner");
     exit(1);
   }
+
+  init_client_queue(&to_flush);
+  init_client_queue(&use_keyspace_success);
+  init_client_queue(&use_keyspace_failed);
 
   print("Listening on %s:%d (version: %s, partitioner: %s)\n",
         ip, port, cassandra_version, cassandra_parititioner);

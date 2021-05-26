@@ -37,7 +37,7 @@ Connect to your [DataStax Astra][astra] cluster using `127.0.0.1:9042`. `cqlsh` 
 ## Future ideas
   
 * Allows for "connect", "query", "close" style drivers
-* OSS posibilities: Automatic token-aware routing, cache prepared statements
+* Apache Cassandra posibilities: Automatic token-aware routing, cache prepared statements, TLS handling
   
 ## Status
 

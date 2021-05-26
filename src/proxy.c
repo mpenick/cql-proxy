@@ -983,6 +983,7 @@ void on_session_connected(CassFuture *future, void *data) {
     write_set_keyspace(client, client->use_keyspace_stream);
     add_to_client_queue(&use_keyspace_success, client);
   }
+  cass_future_free(future);
 }
 
 void do_use_keyspace(client_t *client, statement_t *stmt) {

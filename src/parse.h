@@ -49,6 +49,7 @@ typedef enum {
 
 struct select_statement_s {
   token_t table_type;
+  bool is_table;
   statement_expr_t exprs[MAX_EXPRS];
   int32_t exprs_count;
 };
@@ -125,6 +126,10 @@ static token_t parse_expr(statement_t *stmt, lex_t* lex, token_t token) {
   return token;
 }
 
+static bool is_local_peers(token_t token) {
+  return token == TK_LOCAL || token == TK_PEERS || token == TK_PEERS_V2;
+}
+
 static bool parse_select(statement_t *stmt, lex_t* lex) {
   lex_mark(lex); // Mark exprs, we only copy the exprs if it's a query to intercept
   token_t token = lex_next_token(lex);
@@ -137,20 +142,24 @@ static bool parse_select(statement_t *stmt, lex_t* lex) {
   }
 
   token = lex_next_token(lex);
-  if (token != TK_SYSTEM) {
+  bool is_table = is_local_peers(token);
+  if (token != TK_SYSTEM && !is_table) {
     return false;
   }
 
-  token = lex_next_token(lex);
-  if (token != TK_DOT) {
-    return false;
+  if (!is_table) {
+    token = lex_next_token(lex);
+    if (token != TK_DOT) {
+      return false;
+    }
+
+    token = lex_next_token(lex);
+    if (!is_local_peers(token)) {
+      return false;
+    }
   }
 
-  token = lex_next_token(lex);
-  if (token != TK_LOCAL && token != TK_PEERS && token != TK_PEERS_V2) {
-    return false;
-  }
-
+  stmt->select.is_table = is_table;
   stmt->select.table_type = token;
   stmt->type = STMT_SELECT;
 
@@ -171,11 +180,13 @@ static bool parse_select(statement_t *stmt, lex_t* lex) {
 
 static bool parse_use(statement_t *stmt, lex_t* lex) {
   token_t token = lex_next_token(lex);
-  if (token != TK_SYSTEM && token != TK_ID) {
+  if (token == TK_SYSTEM) {
+    strcpy(stmt->use.keyspace, "system");
+  } else if (token == TK_ID) {
+    strncpy(stmt->use.keyspace, lex->val, sizeof(stmt->use.keyspace) - 1);
+  } else {
     return false;
   }
-
-  strncpy(stmt->use.keyspace, lex->val, sizeof(stmt->use.keyspace) - 1);
   stmt->type = STMT_USE;
   return true;
 }

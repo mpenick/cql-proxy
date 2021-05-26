@@ -42,7 +42,6 @@ Connect to your [DataStax Astra][astra] cluster using `127.0.0.1:9042`. `cqlsh` 
 ## Status
 
 * Very alpha, held together with duct tape and glue (it may crash!)
-* Need to handle the `USE <keyspace>` problem. Session per keyspace?
 * Many opportunites to harden and optimize (reduce allocations, granular locking, batched I/O)
 
 [astra]: https://astra.datastax.com/

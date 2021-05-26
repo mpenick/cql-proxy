@@ -105,10 +105,10 @@ main := |*
     /use/i => { token = TK_USE; fbreak; };
     /as/i => { token = TK_AS; fbreak; };
     /count/i => { token = TK_COUNT; fbreak; };
-    'system'|'\"system\"' => { token = TK_SYSTEM; fbreak; };
-    'local'|'\"local\"' => { token = TK_LOCAL; fbreak; };
-    'peers'|'\"peers\"' => { token = TK_PEERS; fbreak; };
-    'peers_v2'|'\"peers_v2\"' => { token = TK_PEERS_V2; fbreak; };
+    /system/i|'\"system\"' => { token = TK_SYSTEM; fbreak; };
+    /local/i|'\"local\"' => { token = TK_LOCAL; fbreak; };
+    /peers/i|'\"peers\"' => { token = TK_PEERS; fbreak; };
+    /peers_v2/i|'\"peers_v2\"' => { token = TK_PEERS_V2; fbreak; };
     '\*' => { token = TK_STAR; fbreak; };
     ',' => { token = TK_COMMA; fbreak; };
     '\.' => { token = TK_DOT; fbreak; };

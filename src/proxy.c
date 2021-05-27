@@ -696,12 +696,13 @@ void on_result(CassFuture *future, void *data) {
     write_error(request->client, request->stream, CQL_ERROR_SERVER_ERROR, message, message_length);
   } else {
     write_response_result(request->client, request->stream, result);
-    free(request);
   }
   cass_future_free(future);
+  free(request);
 }
 
 void queue_request(client_t* client) {
+  uv_mutex_lock(&client->mutex);
   if (client->queued_count == MAX_QUEUED) {
     do_error(client, CQL_ERROR_OVERLOADED, "Unable to handle request");
     uv_mutex_unlock(&client->mutex);
@@ -712,6 +713,7 @@ void queue_request(client_t* client) {
   entry->frame = client->frame;
   entry->body = malloc((size_t)client->frame.length);
   memcpy(entry->body, client->body, (size_t)client->frame.length);
+  uv_mutex_unlock(&client->mutex);
 }
 
 void do_request(client_t *client, frame_t* frame, char* body) {
@@ -760,7 +762,7 @@ void write_prepared(client_t *client, statement_t *stmt,
   prepared->stmt = *stmt;
 
   char *pos = NULL;
-  if (!stmt || (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_STAR)) {
+  if (!stmt || stmt->type == STMT_USE || (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_STAR)) {
     pos = encode_prepared(body, prepared, keyspace, table, bind_markers, pks, columns);
   } else if (stmt && stmt->select.exprs_count > 0 && stmt->select.exprs[0].type == STMT_EXPR_COUNT) {
     columns_t columns_meta = {
@@ -805,6 +807,7 @@ void do_prepare(client_t *client) {
 
   columns_t bind_markers = {0}; // TODO?
   primary_keys_t pks = {0};
+  columns_t empty_columns = {0};
 
   statement_t stmt = {0};
   if (parse(&stmt, query, (size_t)len)) {
@@ -835,7 +838,8 @@ void do_prepare(client_t *client) {
         }
         break;
       case STMT_USE:
-        do_error(client, CQL_ERROR_INVALID_QUERY, "Cannot prepare \"USE <keyspace\"");
+        write_prepared(client, &stmt, query, "", "",
+                       &bind_markers, &pks, &empty_columns);
         break;
     }
   } else {
@@ -934,6 +938,39 @@ void write_system_peers(client_t *client, const statement_t *stmt) {
   write_rows(client, stmt, "system", "peers", &peers_columns, &empty_rows);
 }
 
+void on_session_connected(CassFuture *future, void *data) {
+  client_t *client = (client_t*)data;
+  CassError rc = cass_future_error_code(future);
+  if (rc != CASS_OK) {
+    const char *message;
+    size_t message_length;
+    cass_future_error_message(future, &message, &message_length);
+    int32_t code = rc == CASS_ERROR_LIB_UNABLE_TO_SET_KEYSPACE ? CQL_ERROR_INVALID_QUERY : CQL_ERROR_SERVER_ERROR;
+    write_error(client, client->use_keyspace_stream, code, message, message_length);
+    add_to_client_queue(&use_keyspace_failed, client);
+  } else {
+    write_set_keyspace(client, client->use_keyspace_stream);
+    add_to_client_queue(&use_keyspace_success, client);
+  }
+  cass_future_free(future);
+}
+
+void do_use_keyspace(client_t *client, const statement_t *stmt) {
+  session_t* s = get_session(stmt->use.keyspace);
+  if (client->use_keyspace_stream >= 0) {
+    do_error(client, CQL_ERROR_OVERLOADED, "Use keyspace already in progress");
+    return;
+  }
+  strncpy(client->keyspace, stmt->use.keyspace, sizeof(client->keyspace) - 1);
+  if (s->is_connected) {
+    write_set_keyspace(client, client->frame.stream);
+  } else {
+    CassFuture *future = cass_session_connect_keyspace(s->session, cluster, stmt->use.keyspace);
+    client->use_keyspace_stream = client->frame.stream;
+    cass_future_set_callback(future, on_session_connected, client);
+  }
+}
+
 void do_execute(client_t *client) {
   char id[32] = {0};
   uint16_t len = sizeof(id) - 1;
@@ -961,6 +998,8 @@ void do_execute(client_t *client) {
           default:
             assert("Invalid system table" && false);
         }
+    } else if (stmt->type == STMT_USE) {
+      do_use_keyspace(client, stmt);
     } else {
       assert("Unsupported prepared statement type" && false);
     }
@@ -968,40 +1007,6 @@ void do_execute(client_t *client) {
     do_request(client, &client->frame, client->body);
   }
 }
-
-void on_session_connected(CassFuture *future, void *data) {
-  client_t *client = (client_t*)data;
-  CassError rc = cass_future_error_code(future);
-  if (rc != CASS_OK) {
-    const char *message;
-    size_t message_length;
-    cass_future_error_message(future, &message, &message_length);
-    int32_t code = rc == CASS_ERROR_LIB_UNABLE_TO_SET_KEYSPACE ? CQL_ERROR_INVALID_QUERY : CQL_ERROR_SERVER_ERROR;
-    write_error(client, client->use_keyspace_stream, code, message, message_length);
-    add_to_client_queue(&use_keyspace_failed, client);
-  } else {
-    write_set_keyspace(client, client->use_keyspace_stream);
-    add_to_client_queue(&use_keyspace_success, client);
-  }
-  cass_future_free(future);
-}
-
-void do_use_keyspace(client_t *client, statement_t *stmt) {
-  session_t* s = get_session(stmt->use.keyspace);
-  if (client->use_keyspace_stream >= 0) {
-    do_error(client, CQL_ERROR_OVERLOADED, "Use keyspace already in progress");
-    return;
-  }
-  strncpy(client->keyspace, stmt->use.keyspace, sizeof(client->keyspace) - 1);
-  if (s->is_connected) {
-    write_set_keyspace(client, client->frame.stream);
-  } else {
-    CassFuture *future = cass_session_connect_keyspace(s->session, cluster, stmt->use.keyspace);
-    client->use_keyspace_stream = client->frame.stream;
-    cass_future_set_callback(future, on_session_connected, client);
-  }
-}
-
 
 void do_query(client_t *client) {
   int32_t len = 0;
@@ -1112,6 +1117,7 @@ void on_response_body_free(response_t *response) {
 void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
 
 void process_queued(client_t *client) {
+  uv_mutex_lock(&client->mutex);
   client->use_keyspace_stream = -1;
   for (size_t i = 0; i < client->queued_count; ++i) {
     queued_t *queued = &client->queued[i];
@@ -1120,6 +1126,7 @@ void process_queued(client_t *client) {
   }
   uv_read_start((uv_stream_t *)&client->tcp, on_alloc, on_read);
   client->queued_count = 0;
+  uv_mutex_unlock(&client->mutex);
 }
 
 void set_keyspace(client_t *client) {
@@ -1136,15 +1143,24 @@ void set_keyspace_failed(client_t *client) {
 
 // Thread-safe
 void flush_client(client_t *client) {
+  batch_t *copy[MAX_BATCH];
+  size_t count = 0;
+
   uv_mutex_lock(&client->mutex);
-  for (size_t i = 0; i < client->batch_count; ++i) {
-    batch_t *batch = client->batches[i];
-    uv_write(&batch->req, (uv_stream_t *)&client->tcp,
-             batch->bufs, batch->count, on_write);
+  count = client->batch_count;
+  for (size_t i = 0;  i < count; ++i) {
+    copy[i] = client->batches[i];
   }
   client->batch = NULL;
   client->batch_count = 0;
   uv_mutex_unlock(&client->mutex);
+
+
+  for (size_t i = 0; i < count; ++i) {
+    batch_t *batch = copy[i];
+    uv_write(&batch->req, (uv_stream_t *)&client->tcp,
+             batch->bufs, batch->count, on_write);
+  }
 }
 
 response_t *get_batch_reponse(client_t *client) {
@@ -1164,21 +1180,24 @@ void add_response_to_batch(client_t *client, response_t *response) {
       uv_buf_init(response->header, sizeof(response->header));
   client->batch->bufs[client->batch->count++] =
       uv_buf_init(response->body, (unsigned int)response->len);
-
 }
 
 // Thread-safe
 void write_response_body(client_t *client, int8_t opcode, int16_t stream, const char *body, size_t body_size) {
   uv_mutex_lock(&client->mutex);
-  if (client->is_closing) return;
-
+  if (client->is_closing) {
+    uv_mutex_unlock(&client->mutex);
+    return;
+  }
   response_t *response = get_batch_reponse(client);
+
   char *pos = encode_header(response->header, stream, opcode);
   encode_int32(pos, (int32_t)body_size); // Length
   response->body = malloc(body_size);
   response->len = body_size;
   memcpy(response->body, body, body_size);
   response->free_cb = on_response_body_free;
+
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
 
@@ -1192,9 +1211,12 @@ void on_response_result_free(response_t *response) {
 // Thread-safe
 void write_response_result(client_t *client, int16_t stream, const CassRawResult *result) {
   uv_mutex_lock(&client->mutex);
-  if (client->is_closing) return;
-
+  if (client->is_closing) {
+    uv_mutex_unlock(&client->mutex);
+    return;
+  }
   response_t *response = get_batch_reponse(client);
+
   char *pos = encode_header(response->header, stream, (int8_t)cass_raw_result_opcode(result));
   // TODO: Handle custom payloads, warnings, tracing
   size_t length = cass_raw_result_frame_length(result);
@@ -1202,6 +1224,7 @@ void write_response_result(client_t *client, int16_t stream, const CassRawResult
   response->body = (char*)cass_raw_result_frame(result);
   response->len = length;
   response->data = (char *)result;
+
   add_response_to_batch(client, response);
   uv_mutex_unlock(&client->mutex);
 

@@ -64,6 +64,8 @@ func (a UpEvent) isEvent() {
 
 type BootstrapEvent struct {
 	Hosts []*Host
+	Partitioner
+	Keyspaces map[string]ReplicationStrategy
 }
 
 func (b BootstrapEvent) isEvent() {
@@ -110,7 +112,7 @@ type ClusterConfig struct {
 }
 
 type ClusterInfo struct {
-	Partitioner    string
+	Partitioner    Partitioner
 	ReleaseVersion string
 	CQLVersion     string
 }
@@ -303,7 +305,10 @@ func (c *Cluster) queryHosts(ctx context.Context, conn *ClientConn, version prim
 	if err != nil {
 		return nil, ClusterInfo{}, err
 	}
-	partitioner := val.(string)
+	partitioner, err := NewPartitionerFromName(val.(string))
+	if err != nil {
+		return nil, ClusterInfo{}, err
+	}
 
 	val, err = row.ByName("release_version")
 	if err != nil {
@@ -339,7 +344,7 @@ func (c *Cluster) addHosts(hosts []*Host, rs *ResultSet) []*Host {
 	for i := 0; i < rs.RowCount(); i++ {
 		row := rs.Row(i)
 		if endpoint, err := c.config.Resolver.NewEndpoint(row); err == nil {
-			if host, err := NewHostFromRow(endpoint, row); err == nil {
+			if host, err := NewHostFromRow(endpoint, c.Info.Partitioner, row); err == nil {
 				hosts = append(hosts, host)
 			}
 		}
@@ -436,7 +441,7 @@ func (c *Cluster) stayConnected() {
 						continue
 					}
 				}
-				newListener.OnEvent(&BootstrapEvent{c.hosts})
+				newListener.OnEvent(&BootstrapEvent{c.hosts, c.Info.Partitioner})
 				c.listeners = append(c.listeners, newListener)
 			case <-refreshTimer.C:
 				c.refreshHosts()
